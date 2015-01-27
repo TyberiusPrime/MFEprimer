@@ -4,13 +4,16 @@ from __future__ import division
 import os
 import sys
 import datetime
-from time import time
+import time
 from optparse import OptionParser
 import sqlite3
 import FastaIterator
+import numpy
+import pyximport; pyximport.install()
+import dna2int
+import tables
+import collections
 
-D2n_dic = dict(A=0, T=3, C=2, G=1, a=0, t=3, c=2, g=1)
-n2D_dic = {0:'A', 3:'T', 2:'C', 1:'G', 0:'a', 3:'t', 2:'c', 1:'g'}
 
 def optget():
     '''parse options'''
@@ -38,184 +41,88 @@ Author: Wubin Qu <quwubin@gmail.com>
 Last updated: 2012-4-24
     ''' % (os.path.basename(sys.argv[0]), os.path.basename(sys.argv[0]))
 
-def get_memory_percent():
-    '''Print Memory information'''
-    import os
-    try:
-	import psutil
-    except:
-	print '''psutil module needed.
+DNA2int = dna2int.DNA2int
+    
 
-	You can download and install it from here: http://code.google.com/p/psutil/
-	'''
-	exit()
 
-    p = psutil.Process(os.getpid())
-    return p.get_memory_percent()
+def store_index(output_filename, lookup_dict, contig_lengths, k):
+    """Store the index in multiple files:
+    header: Defines k and the records indexed. 
+    We use a unified coordinate system, limited to 2**32 -1 bases,
+    and the header lists the offset of each record in this coordinate system
 
-def insert_db(conn, mer_count, plus, minus):
-    for mer_id in xrange(mer_count):
-        conn.execute("insert into pos (mer_id, plus, minus) values (?, ?, ?)", \
-                [mer_id, plus[mer_id], minus[mer_id]])
+    The second file is a (compressed) blz array of kmer start stop offsets
+    offsets[kmer][0] is the start of the respective kmer, offsets[kmer][1] the end of it's run.
+    if offsets[kmer][0] is -1 (2**32) that kmer was not present.
+    
 
-    conn.commit()
+    """
+    print 'writing header'
+    op = open(output_filename + '.header','wb')
+    op.write("k=%i\n" % k)
+    for record_id, length in contig_lengths:
+        op.write("%i:%s\n" % (length, record_id))
+    op.close()
 
-def update_db(conn, mer_count, plus, minus):
-    for mer_id in xrange(mer_count):
-        (plus_data, minus_data) = conn.execute("select plus, minus from pos where mer_id=?", [mer_id]).fetchone()
-        if plus_data:
-            if plus[mer_id]:
-                plus_data += ';%s' % plus[mer_id]
-            else:
-                pass
-        else:
-            plus_data = plus[mer_id]
 
-        if minus_data:
-            if minus[mer_id]:
-                minus_data += ';%s' % minus[mer_id]
-            else:
-                pass
-        else:
-            minus_data = minus[mer_id]
-
-        conn.execute("update pos set plus=?, minus=? where mer_id=?", \
-                [plus_data, minus_data, mer_id])
-
-    conn.commit()
-
-def baseN(num, b):
-    '''convert non-negative decimal integer n to
-    equivalent in another base b (2-36)'''
-    return ((num == 0) and  '0' ) or ( baseN(num // b, b).lstrip('0') + "0123456789abcdefghijklmnopqrstuvwxyz"[num % b])
-
-def int2DNA(num, k):
-    seq = baseN(num, 4)
-    return 'A' * (k-len(seq)) + (''.join([n2D_dic[int(base)] for base in seq]))
-
-def DNA2int_2(seq):
-    '''convert a sub-sequence/seq to a non-negative integer'''
-    plus_mer = 0
-    minus_mer = 0
-    length = len(seq) - 1 
-    for i, letter in enumerate(seq):
-        plus_mer += D2n_dic[letter] * 4 ** (length - i)
-        minus_mer += (3 - D2n_dic[letter]) * 4 ** i
-
-    return plus_mer, minus_mer
-
-def DNA2int(seq):
-    '''convert a sub-sequence/seq to a non-negative integer'''
-    plus_mer = 0
-    length = len(seq) - 1 
-    for i, letter in enumerate(seq):
-        plus_mer += D2n_dic[letter] * 4 ** (length - i)
-
-    return plus_mer
-
+    class KmerOffsets(tables.IsDescription):
+        kmer = tables.UInt32Col()
+        start = tables.UInt32Col()
+        stop = tables.UInt32Col()
+    
+    class Kmer(tables.IsDescription):
+        pos = tables.UInt32Col()
+    filename = output_filename + '.tables' 
+    FILTERS = tables.Filters(complib='zlib', complevel=5)
+    h5file = tables.open_file(filename, mode='w', title='test', filters=FILTERS)
+    group = h5file.create_group("/","kmer_pos", '')
+    table_offsets = h5file.create_table(group, 'offsets', KmerOffsets, '')
+    table_positions = h5file.create_table(group, 'positions', Kmer, '')
+    row_offset = table_offsets.row
+    row_positions = table_positions.row
+    i = 0
+    out_offsets= []
+    for kmer_id, positions in sorted(lookup_dict.items()):
+        for p in positions:
+            row_positions['pos'] = p
+            row_positions.append()
+        start = i
+        i += len(positions)
+        stop = i
+        out_offsets.append((kmer_id, start, stop))
+    table_offsets.append(out_offsets)
+    table_offsets.cols.kmer.create_index()
+    h5file.close()
+   
 def index(filename, k):
     ''''''
-    start = time()
+    start = time.time()
+    print 'indexing', filename
 
     mer_count = 4**k
 
-    dbname = '.'.join(filename.split('.')[:-1]) + '.sqlite3.db'
+    dbname = '.'.join(filename.split('.')[:-1]) + '.mfe_index'
 
-    conn = sqlite3.connect(dbname)
-    cur = conn.cursor()
-    cur.executescript('''
-    drop table if exists pos;
-    create table pos(
-    mer_id integer primary key, 
-    plus text,
-    minus text
-    );''')
-
-    plus = ['']*mer_count
-    minus = ['']*mer_count
+    kmer_lookup = collections.defaultdict(list)
 
     is_empty = False
     is_db_new = True
+    contig_lengths = []
+    total_offset = 0
 
     for record in FastaIterator.parse(open(filename)):
         is_empty = False
         print record.id
-
+        start_time = time.time()
         fasta_seq = record.seq
-	#print 'Time used: ', time() - start
+        dna2int.update_lookup(kmer_lookup, fasta_seq, total_offset, k)
+        contig_lengths.append((record.id, len(fasta_seq)))
+        total_offset += len(fasta_seq)
+        print '%i bp took %.2f seconds' % (len(fasta_seq), time.time() - start_time)
+        
+    store_index(dbname, kmer_lookup, contig_lengths, k)
 
-        plus_mer_list = [''] * mer_count
-        minus_mer_list = [''] * mer_count
-
-        i_max = len(fasta_seq) - k
-        i = 0
-        kmer = fasta_seq[:k]
-        while i < i_max:
-            #print i, len(fasta_seq), i_max
-            #print kmer
-            try:
-                plus_mer_id, minus_mer_id = DNA2int_2(kmer)
-            except:
-                #print 'Unrecognized base: %s' % fasta_seq[i+k]
-                # Skip the unrecognized base, such as 'N'
-                i += 1
-                kmer = kmer[1:] + fasta_seq[i+k-1]
-                continue
-
-            if plus_mer_list[plus_mer_id]:
-                plus_mer_list[plus_mer_id] += ',%i' % (i+k-1)
-            else:
-                plus_mer_list[plus_mer_id] = str(i+k-1)
-
-            if minus_mer_list[minus_mer_id]:
-                minus_mer_list[minus_mer_id] += ',%i' % (i)
-            else:
-                minus_mer_list[minus_mer_id] = str(i)
-
-            i += 1
-            kmer = kmer[1:] + fasta_seq[i+k-1]
-            if not i % 100000:
-                print "%s: %.2f%%, %s" % (record.id, i/i_max*100, str(datetime.timedelta(seconds=(time() - start))))
-        else:
-            pass
-
-	#print 'Time used: ', time() - start
-        for mer_id in xrange(mer_count):
-            if plus_mer_list[mer_id]:
-                if plus[mer_id]:
-                    plus[mer_id] += ';%s:%s' % (record.id, plus_mer_list[mer_id])
-                else:
-                    plus[mer_id] = '%s:%s' % (record.id, plus_mer_list[mer_id])
-
-            if minus_mer_list[mer_id]:
-                if minus[mer_id]:
-                    minus[mer_id] += ';%s:%s' % (record.id, minus_mer_list[mer_id])
-                else:
-                    minus[mer_id] = '%s:%s' % (record.id, minus_mer_list[mer_id])
-
-        memory_percent = get_memory_percent()
-        if memory_percent > 50:
-            if is_db_new:
-                insert_db(conn, mer_count, plus, minus)
-                is_db_new = False
-            else:
-                update_db(conn, mer_count, plus, minus)
-
-            # Empty the container
-            plus = ['']*mer_count
-            minus = ['']*mer_count
-            is_empty = True
-
-            print 'Empty plus and minus due to the memory: %s.' % memory_percent
-
-
-    if not is_empty:
-        if is_db_new:
-            insert_db(conn, mer_count, plus, minus)
-        else:
-            update_db(conn, mer_count, plus, minus)
-
-    print "Time used: %s" % str(datetime.timedelta(seconds=(time() - start)))
+    print "Time used: %s" % str(time.time() - start)
     print 'Done.'
 
 def main():

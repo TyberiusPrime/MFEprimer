@@ -51,14 +51,14 @@ def parse(fh):
         fh = StringIO.StringIO(fh)
 
     # Remove the comment and blank lines before the first record
-    while True:
-        line = fh.readline()
-        if not line: return # Blank line
-	
-	line = line.strip()
+    line = fh.readline()
+    if not line: return # Blank line
+    
+    line = line.strip()
 
-        if line.startswith('>'):
-            break
+    while line.startswith('#'):
+        line = fh.readline()
+        continue
 
     while True:
         if not line.startswith('>'):

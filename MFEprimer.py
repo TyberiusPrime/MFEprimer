@@ -21,6 +21,8 @@ from operator import itemgetter
 import sqlite3
 from pprint import pprint
 import shutil
+import collections
+import tables
 
 from chilli import Seq
 from chilli import SeqCheck
@@ -55,6 +57,87 @@ nn_mm_data = {
 
     'AG' : ['AC'],
     }
+
+class MFEIndex:
+
+    def __init__(self, index_prefix):
+        self.index_prefix = index_prefix
+        self.load_index()
+
+    def load_index(self):
+        self.load_region_info()
+        self.load_position_tables()
+
+    def load_region_info(self):
+        chr_offsets = []
+        chr_lengths = {}
+        with open(self.index_prefix + ".mfe_index.header") as op:
+            lines = op.readlines()
+            self.k = int(lines[0][2:])
+            offset = 0
+            for row in lines[1:]:
+                length = int(row[:row.find(':')])
+                name = row[row.find(':') + 1:].strip()
+                chr_offsets.append((offset, name))
+                offset += length
+                chr_lengths[name] = length
+        self.chr_offsets = chr_offsets
+        self.chr_lengths = chr_lengths
+    
+    def get_region_sizes(self):
+        return self.chr_lengths .copy()
+    
+    def load_position_tables(self):
+        FILTERS = tables.Filters(complib='bzip2')
+        self.h5file = tables.open_file(self.index_prefix + ".mfe_index.tables", mode='r', filters=FILTERS)
+        group = self.h5file.root.kmer_pos
+        self.t_offset = group.offsets
+        self.t_position = group.positions
+
+    def convert_to_relative(self, abs_pos):
+        last_chr = self.chr_offsets[0][1]
+        last_offset = 0
+        for offset, chr in self.chr_offsets:
+            if offset > abs_pos:
+                break
+            else:
+                last_offset = offset
+                last_chr = chr
+        return last_chr, abs_pos - last_offset
+
+    def get_positions(self, kmer):
+        abs_pos = self.get_absolute_positions(kmer)
+        return [self.convert_to_relative(x) for x in abs_pos[0]], [self.convert_to_relative(x) for x in abs_pos[1]]
+
+    def reverse_complement(self, x):
+        """return complementary, reversed sequence to x (keeping case)"""
+        x = x.replace("A", "x")
+        x = x.replace("T", "A")
+        x = x.replace("x", "T")
+        x = x.replace("G", "x")
+        x = x.replace("C", "G")
+        x = x.replace("x", "C")
+        return x[::-1].upper()
+
+    def get_absolute_positions(self, seq):
+        mer_id = chilli.DNA2int(seq)
+        plus = []
+        offset_rows = list(self.t_offset.where('kmer == %i' % mer_id))
+        if offset_rows:
+            for row in self.t_position[offset_rows[0]['start']: offset_rows[0]['stop']]:
+                plus.append(row['pos'])
+
+        mer_id = chilli.DNA2int(self.reverse_complement(seq))
+        minus = []
+        offset_rows = list(self.t_offset.where('kmer == %i' % mer_id))
+        if offset_rows:
+            for row in self.t_position[offset_rows[0]['start']: offset_rows[0]['stop']]:
+                minus.append(row['pos'] - self.k + 1)
+        return plus, minus
+
+    def close(self):
+        self.h5file.close()
+
 
 def get_opt():
     '''Check and parsing the opts'''
@@ -133,7 +216,7 @@ def print_head(out, options):
 
     return out
 
-def primer_analysis(product, options, oligos, session_dir, fcdict, db):
+def primer_analysis(product, options, oligos, session_dir, index, db):
     '''Analysis the candidate forward and reverse primer and check whether they can amplify an amplicon'''
     mid_seq_id_list = []
     tmp_list = []
@@ -202,9 +285,9 @@ def primer_analysis(product, options, oligos, session_dir, fcdict, db):
         pid = amp['pid']
         mid = amp['mid']
 
-        hid = int(amp['hid'])
-        real_hid = fcdict[str(hid)]['id']
-        hdesc = fcdict[str(hid)]['desc']
+        hid = amp['hid']
+        real_hid = hid
+        hdesc = ""
         amp_graphic = draw_graphical_alignment_primer(amp, oligos, options, mid_seq)
         size = amp['size']
         amp['p_3_DeltaG'] = p_3_DeltaG
@@ -245,7 +328,7 @@ def format_output_primer(amp_list, oligos, options, start_time, session_dir):
     out.append(linesep)
 
     out.append('Database = %s' % textwrap.fill(', '.join([os.path.basename(db) for db in options.database]), 80))
-    #out.append('        %s sequences' % (len(fcdict)))
+    #out.append('        %s sequences' % (len(index)))
     out.append(linesep)
 
     out.append('Reports Beginning'.ljust(80, '.'))
@@ -331,7 +414,7 @@ def format_output_primer(amp_list, oligos, options, start_time, session_dir):
         detail_line.append('  ' + 'PPC = %s%%, Size = %s bp, GC content = %.1f%%' % (ppc, amp_len, amp_GC))
         detail_line.append('  ' + 'FP: Tm = %.1f (%s), %sG = %.1f (kcal/mol), 3\'%sG = %.1f (kcal/mol)' % (p_Tm, u'\u2103', u'\u0394', p_DeltaG, u'\u0394', p_3_DeltaG))
         detail_line.append('  ' + 'RP: Tm = %.1f (%s), %sG = %.1f (kcal/mol), 3\'%sG = %.1f (kcal/mol)' % (m_Tm, u'\u2103', u'\u0394', m_DeltaG, u'\u0394', m_3_DeltaG))
-	detail_line.append('  ' + 'Binding sites: %s(%s/%s) ... %s(%s/%s)' % (p_sb, len(p_aseq), f_len, m_se, len(m_aseq), r_len))
+        detail_line.append('  ' + 'Binding sites: %s(%s/%s) ... %s(%s/%s)' % (p_sb, len(p_aseq), f_len, m_se, len(m_aseq), r_len))
         detail_line.append(linesep)
         detail_line.append(amp_graphic + linesep)
         fa_seq = chilli.print_seq(amp_seq, 80)
@@ -495,18 +578,18 @@ def get_mid_seq(mid_seq_id_list, options, session_dir, db):
         out, err = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
     except:
         msg = 'Error: twoBitToFa running error.'
-	print msg
+        print msg
         print2stderr(msg)
     
     if err:
-	print err
+        print err
         print2stderr(err)
 
     try:
         fh = open(outfile)
     except:
         msg = 'Error: twoBitToFa running error: no output file produced.'
-	print msg
+        print msg
         print2stderr(msg)
 
     records = FastaFormatParser.parse(fh)
@@ -522,49 +605,27 @@ def print2stderr(msg):
     print >> sys.stderr, msg
     exit()
 
-def get_pos_data(data):
-    ''''''
-    pos_dict = {}
-    for record in data.split(';'):
-        fields = record.split(':')
-        pos_dict[int(fields[0])] = [int(pos) for pos in fields[1].split(',')]
 
-    return pos_dict
 
-def get_position(options, mer_id, db):
+def get_position(options, kmer, index):
     '''Get position of the mer from SQLite3 database'''
-    plus_pos = {}
-    minus_pos = {}
-    dbname = db + '.sqlite3.db'
-    conn = sqlite3.connect(dbname)
-    cur = conn.cursor()
-    query = "select plus, minus from pos where mer_id=%s" %  mer_id
-    cur.execute(query)
-    try:
-	(plus, minus) = cur.fetchone()
-    except:
-	print "Error found when retrieving position values from indexed database"
-	print "Is the k-value right?"
-	exit()
-
-    if plus:
-	plus_pos = get_pos_data(plus)
-
-    if minus:
-	minus_pos = get_pos_data(minus)
-
-    cur.close()
-    conn.close()
+    plus_pos = collections.defaultdict(list)
+    minus_pos = collections.defaultdict(list)
+    plus, minus = index.get_positions(kmer)
+    for chr, pos in plus:
+        plus_pos[chr].append(pos)
+    for chr, pos in minus:
+        minus_pos[chr].append(pos)
     return plus_pos, minus_pos
 
 def check_infile(options):
     '''Check and return Oligos'''
     err_or_degenerate = SeqCheck.fasta_format_check(options.infile)
     if err_or_degenerate in ['yes', 'no']:
-	global degenerate
-	degenerate = err_or_degenerate
+        global degenerate
+        degenerate = err_or_degenerate
     else:
-	print2stderr(err_or_degenerate)
+        print2stderr(err_or_degenerate)
 
     options.infile.seek(0)
 
@@ -577,22 +638,23 @@ def check_infile(options):
 
     return oligos
 
-def primer_process(options, session_dir, fcdict, db, oligos):
+def primer_process(options, session_dir, index, oligos):
     '''Primer Process'''
     #options.processor = int(options.processor)
     oligo_pos = []
     oligo_id_list = []
     #t1 = time.time()
     for oligo in oligos:
-        primer_seq = oligo['seq']
+        primer_seq = oligo['seq'].upper()
         oligo_id_list.append(oligo['id'])
 
         #mer = primer_seq[-options.k:]
+        #print 'seq', primer_seq[-options.k_value:]
         mer = primer_seq[-options.k_value:]
-        mer_id = chilli.DNA2int(mer)
 
         # p for plus strand, m for minus strand
-        p_pos_list, m_pos_list = get_position(options, mer_id, db)
+        p_pos_list, m_pos_list = get_position(options, mer, index)
+        #print p_pos_list, m_pos_list
 
         oligo_pos.append({
             'p_list' : p_pos_list,
@@ -624,12 +686,12 @@ def primer_process(options, session_dir, fcdict, db, oligos):
                 for p in p_pos:
                     left = get_pos_range(p, m_pos)
                     for pos_index in xrange(left, len(m_pos)):
-			f3_pos = p+1
-			r3_pos = m_pos[pos_index]
+                        f3_pos = p+1
+                        r3_pos = m_pos[pos_index]
 
                         # The amplicon size <= p.len + m.len
-			if f3_pos >= r3_pos:
-			    continue
+                        if f3_pos >= r3_pos:
+                            continue
 
                         product_size = p_oligo_length + m_pos[pos_index] - p + m_oligo_length - 1
 
@@ -643,8 +705,8 @@ def primer_process(options, session_dir, fcdict, db, oligos):
                             p_start = 0
 
                         m_stop = r3_pos + m_oligo_length
-                        if m_stop > fcdict[hid]['size']:
-                            m_stop = fcdict[hid]['size'] 
+                        if m_stop > index.get_region_sizes()[hid]:
+                            m_stop = index.get_region_sizes()[hid]
 
                         binding_range.append('%s:%s-%s' % (hid, p_start, p + 1))
                         # Reverse: Correction for reverse
@@ -664,7 +726,6 @@ def primer_process(options, session_dir, fcdict, db, oligos):
                         }
 
                         product.append(amp)
-
     return product, binding_range
 
 def get_pos_range(value, list_com):
@@ -705,10 +766,12 @@ def extract_by_twoBitToFa(id_pos_range_list, options, session_dir, db):
     cmd = '%s%stwoBitToFa -seqList=%s %s %s' % (bin_path, os.sep, id_pos_range_list_file, twoBitDB, outfile)
 
     try:
-        out, err = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+        out, err = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr = subprocess.PIPE).communicate()
     except:
         msg = 'Error: twoBitToFa running error.'
         print2stderr(msg)
+    if 'invalid' in out:
+        raise ValueError(out)
     
     if err:
         print2stderr(err)
@@ -881,13 +944,17 @@ def process_primer(options, session_dir):
     oligos = check_infile(options)
     amp = []
     for db in options.database:
-        fcdict_cache = db + '.uni'
-        fcdict = chilli.get_cache(fcdict_cache)
-        product, binding_range = primer_process(options, session_dir, fcdict, db, oligos)
-        seq_list = extract_by_twoBitToFa(binding_range, options, session_dir, db)
-        filter_product = get_align_seq(seq_list, options, product)
-        amp_list = primer_analysis(filter_product, options, oligos, session_dir, fcdict, db)
-        amp.extend(amp_list)
+        try:
+            index = None
+            index = MFEIndex(db[:db.rfind('.')])
+            product, binding_range = primer_process(options, session_dir, index, oligos)
+            seq_list = extract_by_twoBitToFa(binding_range, options, session_dir, db)
+            filter_product = get_align_seq(seq_list, options, product)
+            amp_list = primer_analysis(filter_product, options, oligos, session_dir, index, db)
+            amp.extend(amp_list)
+        finally:
+            if index:
+                index.close()
 
     return amp, oligos
 
@@ -900,9 +967,9 @@ def main():
     start_time = time.time()
     amp_list, oligos = process_primer(options, session_dir)
     if options.tab:
-	tab_out(amp_list, oligos, options, start_time, session_dir)
+        tab_out(amp_list, oligos, options, start_time, session_dir)
     else:
-	format_output_primer(amp_list, oligos, options, start_time, session_dir)
+        format_output_primer(amp_list, oligos, options, start_time, session_dir)
 
     # Clean session tmp directory
     try:

@@ -15,9 +15,8 @@ Version = '1.0'
 import sys
 import os
 import argparse
+import dna2int
 
-D2n_dic = dict(A=0, T=3, C=2, G=1, a=0, t=3, c=2, g=1)
-n2D_dic = {0:'A', 3:'T', 2:'C', 1:'G', 0:'a', 3:'t', 2:'c', 1:'g'}
 
 def get_opt():
     '''Get options'''
@@ -30,34 +29,12 @@ def get_opt():
     parser.add_argument('-v', '--version', action='version', version='%(prog)s 1.0')
     args = parser.parse_args()
 
-def DNA2int(seq):
-    '''convert a sub-sequence/seq to a non-negative integer'''
-    result = 0
-    seq_len = len(seq)
-    for i, letter in enumerate(seq):
-        result += D2n_dic[letter] * 4 ** (seq_len - i - 1)
-    return result
-
-def DNA2int_2_strand(seq):
-    '''convert a sub-sequence/seq to a non-negative integer'''
-    plus_mer = 0
-    minus_mer = 0
-    length = len(seq) - 1 
-    for i, letter in enumerate(seq):
-        plus_mer += D2n_dic[letter] * 4 ** (length - i)
-        minus_mer += (3 - D2n_dic[letter]) * 4 ** i
-
-    return plus_mer, minus_mer
+DNA2int = dna2int.DNA2int
 
 def baseN(num, b):
     '''convert non-negative decimal integer n to
     equivalent in another base b (2-36)'''
     return ((num == 0) and  '0' ) or ( baseN(num // b, b).lstrip('0') + "0123456789abcdefghijklmnopqrstuvwxyz"[num % b])
-
-def int2DNA(num, k):
-    ''''''
-    seq = baseN(num ,4)
-    return 'A'* (k-len(seq))+(''.join([n2D_dic[int(base)]  for base in seq]))
 
 def session(parent_dir=None):
     '''Create session directory'''
